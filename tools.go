@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -298,14 +299,23 @@ func registerTools(s *mcp.Server, client *VyosClient) {
 			"storage": {"system", "storage"},
 		}
 		results := make(map[string]any)
+		var mu sync.Mutex
+		var wg sync.WaitGroup
 		for label, path := range checks {
-			result, err := client.Show(ctx, path)
-			if err != nil {
-				results[label] = fmt.Sprintf("Error: %s", err.Error())
-			} else {
-				results[label] = result
-			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				result, err := client.Show(ctx, path)
+				mu.Lock()
+				defer mu.Unlock()
+				if err != nil {
+					results[label] = fmt.Sprintf("Error: %s", err.Error())
+				} else {
+					results[label] = result
+				}
+			}()
 		}
+		wg.Wait()
 		return textResult(results)
 	})
 }

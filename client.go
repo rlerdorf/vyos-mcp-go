@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -13,6 +14,9 @@ import (
 	"time"
 )
 
+// maxResponseBytes caps the response body read to prevent memory exhaustion.
+const maxResponseBytes = 10 * 1024 * 1024 // 10 MB
+
 // VyosClient wraps the VyOS REST API.
 // Direct port of VyosClient.php.
 type VyosClient struct {
@@ -21,14 +25,14 @@ type VyosClient struct {
 	http   *http.Client
 }
 
-func NewVyosClient(host, apiKey string) *VyosClient {
+func NewVyosClient(host, apiKey string, tlsInsecure bool) *VyosClient {
 	return &VyosClient{
 		host:   strings.TrimRight(host, "/"),
 		apiKey: apiKey,
 		http: &http.Client{
 			Timeout: 30 * time.Second,
 			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: tlsInsecure}, //nolint:gosec
 			},
 		},
 	}
@@ -43,7 +47,11 @@ func NewVyosClientFromEnv() (*VyosClient, error) {
 	if apiKey == "" {
 		return nil, fmt.Errorf("VYOS_API_KEY environment variable is required")
 	}
-	return NewVyosClient(host, apiKey), nil
+	// VYOS_TLS_INSECURE defaults to true because VyOS ships with a self-signed
+	// certificate. Set VYOS_TLS_INSECURE=false to enable strict TLS verification
+	// when a valid certificate is in place.
+	tlsInsecure := os.Getenv("VYOS_TLS_INSECURE") != "false"
+	return NewVyosClient(host, apiKey, tlsInsecure), nil
 }
 
 // request sends a POST with multipart form data (data + key) to the VyOS API.
@@ -53,13 +61,19 @@ func (c *VyosClient) request(ctx context.Context, endpoint string, data any) (an
 		return nil, fmt.Errorf("marshal request data: %w", err)
 	}
 
-	var body strings.Builder
+	var body bytes.Buffer
 	w := multipart.NewWriter(&body)
-	w.WriteField("data", string(dataJSON))
-	w.WriteField("key", c.apiKey)
-	w.Close()
+	if err := w.WriteField("data", string(dataJSON)); err != nil {
+		return nil, fmt.Errorf("write data field: %w", err)
+	}
+	if err := w.WriteField("key", c.apiKey); err != nil {
+		return nil, fmt.Errorf("write key field: %w", err)
+	}
+	if err := w.Close(); err != nil {
+		return nil, fmt.Errorf("close multipart writer: %w", err)
+	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", c.host+endpoint, strings.NewReader(body.String()))
+	req, err := http.NewRequestWithContext(ctx, "POST", c.host+endpoint, &body)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
@@ -71,9 +85,12 @@ func (c *VyosClient) request(ctx context.Context, endpoint string, data any) (an
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
 		return nil, fmt.Errorf("read response: %w", err)
+	}
+	if int64(len(respBody)) == maxResponseBytes {
+		return nil, fmt.Errorf("VyOS API response exceeds %d bytes", maxResponseBytes)
 	}
 
 	if resp.StatusCode != 200 {

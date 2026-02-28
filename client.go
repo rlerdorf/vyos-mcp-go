@@ -199,16 +199,32 @@ func (c *VyosClient) ReturnValues(ctx context.Context, path []string) (any, erro
 		return nil, err
 	}
 	// Output is space-separated single-quoted values: 'val1' 'val2'
+	// Values may contain spaces, so we parse quoted tokens explicitly.
 	trimmed := strings.TrimSpace(out)
 	if trimmed == "" {
 		return []string{}, nil
 	}
-	// Parse single-quoted values
+	return parseQuotedValues(trimmed), nil
+}
+
+// parseQuotedValues parses VyOS returnValues output: space-separated
+// single-quoted tokens, e.g. 'val1' 'val with spaces' 'val3'.
+func parseQuotedValues(s string) []string {
 	var values []string
-	for _, part := range strings.Fields(trimmed) {
-		values = append(values, strings.Trim(part, "'"))
+	for len(s) > 0 {
+		if s[0] != '\'' {
+			break
+		}
+		idx := strings.IndexByte(s[1:], '\'')
+		if idx < 0 {
+			// Malformed: unclosed quote — return remainder stripped of the leading quote
+			values = append(values, s[1:])
+			break
+		}
+		values = append(values, s[1:idx+1])
+		s = strings.TrimSpace(s[idx+2:])
 	}
-	return values, nil
+	return values
 }
 
 // --- Config writes (serialized) ---
@@ -284,6 +300,14 @@ func (c *VyosClient) Reset(ctx context.Context, path []string) (any, error) {
 
 func (c *VyosClient) Generate(ctx context.Context, path []string) (any, error) {
 	out, err := c.run(ctx, opCmdWrapper, append([]string{"generate"}, path...)...)
+	if err != nil {
+		return nil, err
+	}
+	return strings.TrimRight(out, "\n"), nil
+}
+
+func (c *VyosClient) Ping(ctx context.Context, host string, count int) (any, error) {
+	out, err := c.run(ctx, opCmdWrapper, "ping", host, "count", strconv.Itoa(count))
 	if err != nil {
 		return nil, err
 	}

@@ -8,6 +8,8 @@ ExecStart=/config/user-data/vyos-mcp-go
 EnvironmentFile=/config/user-data/.env
 Restart=on-failure
 RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
 
 [Install]
 WantedBy=multi-user.target

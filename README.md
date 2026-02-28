@@ -44,7 +44,8 @@ By binding to localhost, the only way to reach the server is through an SSH tunn
 
 - API credentials are stored in a separate `.env` file with `chmod 600`
 - The SSH tunnel inherits your existing SSH key authentication and encryption
-- The VyOS REST API uses HTTPS (TLS verification is disabled for self-signed certs, which is standard for VyOS)
+- The VyOS REST API uses HTTPS (TLS verification is disabled by default for self-signed certs, which is standard for VyOS; set `VYOS_TLS_INSECURE=false` to enable strict verification when a valid cert is available)
+- The systemd service runs with `NoNewPrivileges=yes` and `PrivateTmp=yes`
 
 ## Prerequisites
 
@@ -119,6 +120,12 @@ VYOS_API_KEY=your-api-key-here
 ```
 
 `VYOS_HOST` must point to the IP where the VyOS REST API listens (typically the LAN interface IP, not `127.0.0.1`, since the API binds to the configured `listen-address`).
+
+`VYOS_TLS_INSECURE` controls TLS certificate verification for the VyOS API connection. It defaults to `true` because VyOS ships with a self-signed certificate. Set it to `false` if you have a valid certificate installed:
+
+```
+VYOS_TLS_INSECURE=false
+```
 
 ### Subsequent deployments
 

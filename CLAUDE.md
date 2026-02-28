@@ -1,6 +1,6 @@
 # VyOS Go MCP Server
 
-Go-based MCP server that runs directly on the VyOS router as a persistent daemon.
+Go-based MCP server that runs directly on the VyOS router as a persistent daemon. Calls VyOS CLI tools directly -- no REST API, no API key, no HTTPS needed.
 
 ## Build
 
@@ -14,8 +14,10 @@ Uses `ensure-go.sh` to auto-download Go 1.26+ if the system Go is too old. The t
 ## Architecture
 
 - `main.go` -- HTTP server entry point, Streamable HTTP transport on `/mcp`
-- `client.go` -- VyOS REST API client (port of VyosClient.php)
-- `tools.go` -- 18 MCP tool registrations (port of VyosTools.php)
+- `client.go` -- VyOS CLI client (calls cli-shell-api, my_set, my_delete, etc. directly)
+- `tools.go` -- 18 MCP tool registrations
+
+The client creates a VyOS config session at startup via `cli-shell-api getSessionEnv` + `setupSession`, then uses CLI tools directly. This is the same approach the VyOS HTTP API uses internally.
 
 ## On-router deployment
 
@@ -24,7 +26,6 @@ Binary and service file live in `/config/user-data/` (persists across VyOS upgra
 ```
 /config/user-data/vyos-mcp-go          # Static binary
 /config/user-data/mcp-server.service   # systemd unit
-/config/user-data/.env                 # VYOS_HOST + VYOS_API_KEY (chmod 600)
 ```
 
 Daemon binds to `127.0.0.1:8384` (localhost only). Access from workstation via SSH tunnel.

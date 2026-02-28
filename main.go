@@ -19,10 +19,11 @@ func main() {
 	addr := flag.String("addr", "127.0.0.1:8384", "listen address")
 	flag.Parse()
 
-	client, err := NewVyosClientFromEnv()
+	client, err := NewVyosClient()
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer client.Close()
 
 	mcpServer := mcp.NewServer(&mcp.Implementation{
 		Name:    "VyOS Router",

@@ -5,7 +5,6 @@ After=network.target vyos-router.target
 [Service]
 Type=simple
 ExecStart=/config/user-data/vyos-mcp-go
-EnvironmentFile=/config/user-data/.env
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=yes

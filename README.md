@@ -5,9 +5,10 @@ A native Go [MCP](https://modelcontextprotocol.io/) server for [VyOS](https://vy
 ## Why
 
 - **Zero runtime dependencies** -- one static binary, no PHP/Python/Node
+- **No REST API needed** -- calls VyOS CLI tools directly, no API key or HTTPS configuration required
 - **Persistent daemon** -- runs on the router itself, sessions survive across client reconnects
-- **Survives upgrades** -- binary and config live in `/config/`, which persists across VyOS image upgrades
-- **Low latency** -- the MCP server talks to the VyOS REST API over localhost instead of crossing the network
+- **Survives upgrades** -- binary lives in `/config/`, which persists across VyOS image upgrades
+- **Low latency** -- direct CLI execution, no network stack involved
 
 ## Architecture
 
@@ -19,8 +20,9 @@ Workstation                          VyOS Router
 |  etc.)    |                       | Streamable HTTP on /mcp |
 +-----------+                       |         |               |
                                     |         v               |
-                                    |  VyOS REST API          |
-                                    |  https://<lan-ip>       |
+                                    |  VyOS CLI tools          |
+                                    |  (vyatta-op-cmd-wrapper, |
+                                    |   cli-shell-api, etc.)   |
                                     +-------------------------+
 ```
 
@@ -34,7 +36,7 @@ The MCP server binds to `127.0.0.1:8384` and **must not** be exposed on a networ
 
 - **The MCP protocol has no authentication.** Any client that can reach the HTTP endpoint can call any tool -- including `vyos_set_config`, `vyos_delete_config`, and `vyos_commit`. That's full read/write access to your router's configuration with no credentials required.
 - **This runs on your router.** A compromised router means a compromised network. Firewall rules, NAT, DNS, DHCP -- all controlled through these tools.
-- **The VyOS API key is baked into the daemon.** The server holds the API key in memory and uses it for every request. Exposing the MCP endpoint is equivalent to exposing the API key itself.
+- **The daemon runs with root privileges.** It needs access to VyOS config session tools which require root. Exposing the MCP endpoint would give unauthenticated remote root-level config access.
 
 By binding to localhost, the only way to reach the server is through an SSH tunnel, which provides authentication (SSH keys), encryption, and access control that MCP itself lacks.
 
@@ -42,43 +44,30 @@ By binding to localhost, the only way to reach the server is through an SSH tunn
 
 ### Other measures
 
-- API credentials are stored in a separate `.env` file with `chmod 600`
 - The SSH tunnel inherits your existing SSH key authentication and encryption
-- The VyOS REST API uses HTTPS (TLS verification is disabled by default for self-signed certs, which is standard for VyOS; set `VYOS_TLS_INSECURE=false` to enable strict verification when a valid cert is available)
 - The systemd service runs with `NoNewPrivileges=yes` and `PrivateTmp=yes`
+- Config-modifying operations are serialized with a mutex to prevent race conditions
 
 ## Prerequisites
 
-- VyOS 1.4+ with the [REST API enabled](https://docs.vyos.io/en/latest/configuration/service/https.html)
-- SSH access to the router (key-based recommended)
+- VyOS 1.4+ (tested on 1.5 rolling)
+- SSH access to the router with sudo (key-based recommended)
 - Go 1.26+ on your build machine (or let `ensure-go.sh` download it automatically)
 
-### Enabling the VyOS REST API
-
-If the API isn't already configured:
-
-```
-configure
-set service https api keys id my-key key 'YOUR-SECRET-KEY-HERE'
-set service https listen-address <your-lan-ip>
-commit
-save
-```
-
-Note the API key and LAN IP -- you'll need them for deployment.
+**Note:** Unlike the REST API approach, this server does **not** require the VyOS HTTPS API to be enabled. It calls VyOS CLI tools directly.
 
 ## Quick Start
 
 ```bash
-git clone https://github.com/youruser/vyos-mcp-go.git
+git clone https://github.com/rlerdorf/vyos-mcp-go.git
 cd vyos-mcp-go
 
 # Build (cross-compiles a static linux/amd64 binary)
 make build
 
-# First-time deploy to router
+# Deploy to router
 # Requires: SSH host "router" configured in ~/.ssh/config
-make deploy-init VYOS_API_KEY='your-api-key' VYOS_LAN_IP='192.168.1.1'
+make deploy
 
 # Open an SSH tunnel (in a separate terminal or as a background service)
 make tunnel
@@ -108,32 +97,8 @@ Override the hostname in the Makefile with `ROUTER=your-host`.
 |------|-------------------|---------|
 | `vyos-mcp-go` | `/config/user-data/vyos-mcp-go` | Static binary |
 | `mcp-server.service` | `/config/user-data/mcp-server.service` | systemd unit |
-| `.env` | `/config/user-data/.env` | API credentials (chmod 600) |
 
-### Environment variables
-
-The `.env` file on the router contains:
-
-```
-VYOS_HOST=https://192.168.1.1
-VYOS_API_KEY=your-api-key-here
-```
-
-`VYOS_HOST` must point to the IP where the VyOS REST API listens (typically the LAN interface IP, not `127.0.0.1`, since the API binds to the configured `listen-address`).
-
-`VYOS_TLS_INSECURE` controls TLS certificate verification for the VyOS API connection. It defaults to `true` because VyOS ships with a self-signed certificate. Set it to `false` if you have a valid certificate installed:
-
-```
-VYOS_TLS_INSECURE=false
-```
-
-### Subsequent deployments
-
-After the initial deploy, use `make deploy` -- it skips `.env` creation and just updates the binary and service file:
-
-```bash
-make deploy
-```
+That's it -- no config files, no API keys, no environment variables.
 
 ### Surviving reboots
 
@@ -210,13 +175,13 @@ systemctl --user enable --now vyos-mcp-tunnel
 
 | Tool | Description |
 |------|-------------|
-| `vyos_show_config` | Retrieve VyOS configuration at a path |
+| `vyos_show_config` | Retrieve VyOS configuration at a path (JSON or raw format) |
 | `vyos_set_config` | Set a configuration value |
 | `vyos_batch_config` | Set or delete multiple values atomically |
 | `vyos_delete_config` | Delete a configuration node |
 | `vyos_config_exists` | Check if a configuration path exists |
 | `vyos_return_values` | Get values at a configuration path |
-| `vyos_commit` | Commit pending changes (with optional comment and confirm timeout) |
+| `vyos_commit` | Commit pending changes |
 | `vyos_save_config` | Save running configuration to startup config |
 
 ### Operational
@@ -231,8 +196,8 @@ systemctl --user enable --now vyos-mcp-tunnel
 
 | Tool | Description |
 |------|-------------|
-| `vyos_ping` | Ping a host from the router (uses traceroute/mtr -- VyOS has no ping API) |
-| `vyos_traceroute` | Traceroute to a host |
+| `vyos_ping` | Ping a host from the router (uses mtr for latency data) |
+| `vyos_traceroute` | Traceroute to a host (mtr with JSON output) |
 | `vyos_dhcp_leases` | Show DHCP server leases |
 
 ### Monitoring
@@ -272,7 +237,7 @@ make deploy ROUTER=my-router DEPLOY_DIR=/config/scripts
 ```
 vyos-mcp-go/
   main.go              HTTP server, Streamable HTTP handler, graceful shutdown
-  client.go            VyOS REST API client (multipart form POST)
+  client.go            VyOS CLI client (calls vyatta-op-cmd-wrapper, cli-shell-api, etc.)
   tools.go             18 MCP tool registrations
   mcp-server.service   systemd unit file
   ensure-go.sh         Auto-downloads Go toolchain if needed
@@ -282,14 +247,25 @@ vyos-mcp-go/
 
 ## How It Works
 
-### VyOS REST API
+### VyOS CLI Integration
 
-The VyOS REST API uses POST requests with multipart form data:
+The server creates a VyOS config session at startup (via `cli-shell-api getSessionEnv` + `setupSession`) and uses VyOS CLI tools directly:
 
-- `data` field: JSON with operation details (`op`, `path`, etc.)
-- `key` field: API key string
+| Operation | CLI Tool |
+|-----------|----------|
+| Show config | `/bin/cli-shell-api showConfig` |
+| Config exists | `/bin/cli-shell-api existsActive` |
+| Return values | `/bin/cli-shell-api returnActiveValues` |
+| Set config | `/opt/vyatta/sbin/my_set` |
+| Delete config | `/opt/vyatta/sbin/my_delete` |
+| Commit | `/opt/vyatta/sbin/my_commit` |
+| Save | `/usr/libexec/vyos/vyos-save-config.py` |
+| Show (operational) | `/opt/vyatta/bin/vyatta-op-cmd-wrapper show` |
+| Reset / Generate | `/opt/vyatta/bin/vyatta-op-cmd-wrapper reset/generate` |
+| Traceroute | `/usr/libexec/vyos/op_mode/mtr_execute.py` |
+| Config to JSON | `/usr/bin/vyos-config-to-json` |
 
-The `client.go` file wraps all [VyOS API endpoints](https://docs.vyos.io/en/latest/configuration/service/https.html): `/retrieve`, `/configure`, `/config-file`, `/show`, `/generate`, `/reset`, `/traceroute`.
+This is the same approach the VyOS HTTP API server uses internally -- it shells out to these exact tools. By calling them directly, we skip the HTTPS/API-key/nginx layer entirely.
 
 ### MCP Transport
 

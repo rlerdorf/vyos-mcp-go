@@ -270,9 +270,22 @@ Uses the official [Go MCP SDK](https://github.com/modelcontextprotocol/go-sdk)'s
 
 ## Security
 
-- The daemon binds to `127.0.0.1` only -- never exposed to the network
-- Access is through SSH tunnel, inheriting SSH's authentication and encryption
+### Why localhost-only binding matters
+
+The MCP server binds to `127.0.0.1:8384` and **must not** be exposed on a network interface. This is critical because:
+
+- **The MCP protocol has no authentication.** Any client that can reach the HTTP endpoint can call any tool -- including `vyos_set_config`, `vyos_delete_config`, and `vyos_commit`. That's full read/write access to your router's configuration with no credentials required.
+- **This runs on your router.** A compromised router means a compromised network. Firewall rules, NAT, DNS, DHCP -- all controlled through these tools.
+- **The VyOS API key is baked into the daemon.** The server holds the API key in memory and uses it for every request. Exposing the MCP endpoint is equivalent to exposing the API key itself.
+
+By binding to localhost, the only way to reach the server is through an SSH tunnel, which provides authentication (SSH keys), encryption, and access control that MCP itself lacks.
+
+**Never** change the listen address to `0.0.0.0` or a LAN IP. If you need remote access, always use an SSH tunnel.
+
+### Other measures
+
 - API credentials are stored in a separate `.env` file with `chmod 600`
+- The SSH tunnel inherits your existing SSH key authentication and encryption
 - The VyOS REST API uses HTTPS (TLS verification is disabled for self-signed certs, which is standard for VyOS)
 
 ## License

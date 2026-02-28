@@ -234,9 +234,11 @@ func registerTools(s *mcp.Server, client *VyosClient) {
 		Name:        "vyos_ping",
 		Description: "Ping a host from the router",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, input pingInput) (*mcp.CallToolResult, any, error) {
-		// VyOS has no /ping API endpoint. Use /traceroute (mtr) which provides
-		// latency data for each hop including the destination.
-		result, err := client.Traceroute(ctx, input.Host)
+		count := input.Count
+		if count <= 0 {
+			count = 5
+		}
+		result, err := client.Ping(ctx, input.Host, count)
 		if err != nil {
 			return nil, nil, err
 		}

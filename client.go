@@ -19,6 +19,7 @@ const (
 	mySet        = "/opt/vyatta/sbin/my_set"
 	myDelete     = "/opt/vyatta/sbin/my_delete"
 	myCommit     = "/opt/vyatta/sbin/my_commit"
+	configMgmt   = "/usr/bin/config-mgmt"
 	opCmdWrapper = "/opt/vyatta/bin/vyatta-op-cmd-wrapper"
 	saveConfigPy = "/usr/libexec/vyos/vyos-save-config.py"
 	configToJSON = "/usr/bin/vyos-config-to-json"
@@ -270,8 +271,45 @@ func (c *VyosClient) DeleteConfig(ctx context.Context, path []string) error {
 func (c *VyosClient) Commit(ctx context.Context, comment *string, confirmTimeout *int) error {
 	c.configMu.Lock()
 	defer c.configMu.Unlock()
-	// TODO: comment and confirmTimeout support via commit-confirm tools
-	return c.runSilent(ctx, myCommit)
+
+	// Always commit first
+	if err := c.runSilent(ctx, myCommit); err != nil {
+		return err
+	}
+
+	// If commit-confirm requested, schedule auto-rollback timer
+	if confirmTimeout != nil && *confirmTimeout > 0 {
+		minutes := *confirmTimeout
+		action := `sg vyattacfg "/usr/bin/config-mgmt revert_soft"`
+		timerCmd := fmt.Sprintf("systemd-run --quiet --on-active=%dm --unit=commit-confirm %s", minutes, action)
+		cmd := exec.CommandContext(ctx, "sudo", "bash", "-c", timerCmd)
+		cmd.Env = c.sessionEnv
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to set rollback timer: %s: %w", strings.TrimSpace(string(out)), err)
+		}
+	}
+
+	return nil
+}
+
+// Confirm locks in a pending commit-confirm, cancelling the auto-rollback.
+func (c *VyosClient) Confirm(ctx context.Context) error {
+	c.configMu.Lock()
+	defer c.configMu.Unlock()
+
+	// Stop the rollback timer
+	cmd := exec.CommandContext(ctx, "sudo", "systemctl", "stop", "--quiet", "commit-confirm.timer")
+	cmd.Env = c.sessionEnv
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("no confirm pending or failed to stop timer: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+
+	// Kill notification script if running
+	killCmd := exec.CommandContext(ctx, "sudo", "pkill", "-f", "commit-confirm-notify.py")
+	killCmd.Env = c.sessionEnv
+	_ = killCmd.Run() // ignore error if not running
+
+	return nil
 }
 
 func (c *VyosClient) Save(ctx context.Context) error {

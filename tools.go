@@ -52,7 +52,7 @@ func textMsg(msg string) (*mcp.CallToolResult, any, error) {
 	}, nil, nil
 }
 
-// registerTools adds all 18 VyOS MCP tools to the server.
+// registerTools adds all 19 VyOS MCP tools to the server.
 func registerTools(s *mcp.Server, client *VyosClient) {
 	// --- Config queries ---
 
@@ -170,6 +170,16 @@ func registerTools(s *mcp.Server, client *VyosClient) {
 			return nil, nil, err
 		}
 		return textMsg("Configuration committed successfully")
+	})
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "vyos_confirm",
+		Description: "Confirm a pending commit-confirm, cancelling the auto-rollback",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, input struct{}) (*mcp.CallToolResult, any, error) {
+		if err := client.Confirm(ctx); err != nil {
+			return nil, nil, err
+		}
+		return textMsg("Commit confirmed successfully")
 	})
 
 	mcp.AddTool(s, &mcp.Tool{

@@ -9,29 +9,61 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
+// --- Helpers ---
+
+func boolPtr(b bool) *bool { return &b }
+
+func readOnly(title string) *mcp.ToolAnnotations {
+	return &mcp.ToolAnnotations{
+		Title:        title,
+		ReadOnlyHint: true,
+		OpenWorldHint: boolPtr(false),
+	}
+}
+
+func writeOp(title string) *mcp.ToolAnnotations {
+	return &mcp.ToolAnnotations{
+		Title:           title,
+		ReadOnlyHint:    false,
+		DestructiveHint: boolPtr(false),
+		IdempotentHint:  true,
+		OpenWorldHint:   boolPtr(false),
+	}
+}
+
+func destructiveOp(title string) *mcp.ToolAnnotations {
+	return &mcp.ToolAnnotations{
+		Title:           title,
+		ReadOnlyHint:    false,
+		DestructiveHint: boolPtr(true),
+		IdempotentHint:  true,
+		OpenWorldHint:   boolPtr(false),
+	}
+}
+
 // --- Input types ---
 
 type showConfigInput struct {
-	Path   []string `json:"path,omitempty" jsonschema:"Configuration path components"`
-	Format string   `json:"format,omitempty" jsonschema:"Output format"`
+	Path   []string `json:"path,omitempty" jsonschema:"Configuration path components to retrieve. Each element is one level of the config tree. Example: [\"interfaces\", \"ethernet\", \"eth0\"] retrieves the eth0 interface config. Omit for the full configuration tree."`
+	Format string   `json:"format,omitempty" jsonschema:"Output format for the configuration. Use \"json\" for structured data (default) or \"commands\" for VyOS set-style command output."`
 }
 
 type pathInput struct {
-	Path []string `json:"path" jsonschema:"Configuration path components"`
+	Path []string `json:"path" jsonschema:"Configuration path components, where each element is one level of the VyOS config tree. Example: [\"interfaces\", \"ethernet\", \"eth0\", \"description\", \"WAN\"] sets the description of eth0 to WAN."`
 }
 
 type commitInput struct {
-	Comment        *string `json:"comment,omitempty" jsonschema:"Optional commit comment"`
-	ConfirmTimeout *int    `json:"confirmTimeout,omitempty" jsonschema:"Minutes before auto-rollback if not confirmed"`
+	Comment        *string `json:"comment,omitempty" jsonschema:"Optional human-readable comment describing the configuration change. Stored in the commit log for auditing."`
+	ConfirmTimeout *int    `json:"confirmTimeout,omitempty" jsonschema:"If set, the commit will auto-rollback after this many minutes unless confirmed with vyos_confirm. Use this as a safety net when making potentially disruptive changes like firewall or interface modifications."`
 }
 
 type hostInput struct {
-	Host string `json:"host" jsonschema:"Hostname or IP address"`
+	Host string `json:"host" jsonschema:"Target hostname or IP address (IPv4 or IPv6) to probe from the router."`
 }
 
 type pingInput struct {
-	Host  string `json:"host" jsonschema:"Hostname or IP to ping"`
-	Count int    `json:"count,omitempty" jsonschema:"Number of pings"`
+	Host  string `json:"host" jsonschema:"Target hostname or IP address (IPv4 or IPv6) to ping from the router."`
+	Count int    `json:"count,omitempty" jsonschema:"Number of ICMP echo requests to send. Defaults to 5 if omitted. Maximum recommended value is 20 to avoid long waits."`
 }
 
 // --- Helpers ---
@@ -52,13 +84,17 @@ func textMsg(msg string) (*mcp.CallToolResult, any, error) {
 	}, nil, nil
 }
 
-// registerTools adds all 19 VyOS MCP tools to the server.
+// registerTools adds all VyOS MCP tools to the server.
 func registerTools(s *mcp.Server, client *VyosClient) {
 	// --- Config queries ---
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name:        "vyos_show_config",
-		Description: "Retrieve VyOS configuration at a path",
+		Name: "vyos_show_config",
+		Description: "Retrieve the VyOS router's running configuration at a given path. " +
+			"Use this to inspect current settings before making changes, verify applied configuration, " +
+			"or explore the configuration tree. Returns the full config tree if no path is specified. " +
+			"Output is JSON by default, or VyOS set-style commands if format is \"commands\".",
+		Annotations: readOnly("Show Configuration"),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, input showConfigInput) (*mcp.CallToolResult, any, error) {
 		if input.Path == nil {
 			input.Path = []string{}
@@ -74,8 +110,13 @@ func registerTools(s *mcp.Server, client *VyosClient) {
 	})
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name:        "vyos_set_config",
-		Description: "Set a VyOS configuration value",
+		Name: "vyos_set_config",
+		Description: "Set a VyOS configuration value in the candidate configuration. " +
+			"The change is staged but not yet active — you must call vyos_commit to apply it. " +
+			"The path represents the full configuration node including the value. " +
+			"For example, path [\"interfaces\", \"ethernet\", \"eth0\", \"description\", \"LAN\"] " +
+			"sets eth0's description to \"LAN\". Idempotent: setting the same value twice has no effect.",
+		Annotations: writeOp("Set Configuration"),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, input pathInput) (*mcp.CallToolResult, any, error) {
 		if err := client.SetConfig(ctx, input.Path); err != nil {
 			return nil, nil, err
@@ -85,19 +126,23 @@ func registerTools(s *mcp.Server, client *VyosClient) {
 
 	// vyos_batch_config uses raw AddTool for complex array-of-objects schema
 	s.AddTool(&mcp.Tool{
-		Name:        "vyos_batch_config",
-		Description: "Set or delete multiple configuration values atomically",
+		Name: "vyos_batch_config",
+		Description: "Set or delete multiple configuration values in a single atomic operation. " +
+			"Use this instead of multiple vyos_set_config/vyos_delete_config calls when making related changes " +
+			"that should succeed or fail together. Changes are staged in the candidate configuration — " +
+			"you must call vyos_commit to apply them. Each operation specifies \"set\" or \"delete\" and a path array.",
+		Annotations: writeOp("Batch Configuration"),
 		InputSchema: json.RawMessage(`{
 			"type": "object",
 			"properties": {
 				"operations": {
 					"type": "array",
-					"description": "Array of operations, each with \"op\" (set/delete) and \"path\"",
+					"description": "Array of configuration operations to apply atomically. Each operation has an \"op\" field (\"set\" or \"delete\") and a \"path\" field (array of path components). Example: [{\"op\": \"set\", \"path\": [\"interfaces\", \"ethernet\", \"eth0\", \"description\", \"WAN\"]}, {\"op\": \"delete\", \"path\": [\"interfaces\", \"ethernet\", \"eth1\", \"disable\"]}]",
 					"items": {
 						"type": "object",
 						"properties": {
-							"op": {"type": "string", "enum": ["set", "delete"]},
-							"path": {"type": "array", "items": {"type": "string"}}
+							"op": {"type": "string", "enum": ["set", "delete"], "description": "The operation type: \"set\" to create or update a config node, \"delete\" to remove it."},
+							"path": {"type": "array", "items": {"type": "string"}, "description": "Configuration path components. Each element is one level of the VyOS config tree, with the final element being the value for set operations."}
 						},
 						"required": ["op", "path"]
 					}
@@ -129,8 +174,12 @@ func registerTools(s *mcp.Server, client *VyosClient) {
 	})
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name:        "vyos_delete_config",
-		Description: "Delete a VyOS configuration node",
+		Name: "vyos_delete_config",
+		Description: "Delete a VyOS configuration node from the candidate configuration. " +
+			"Removes the specified config path and all its children. The change is staged — " +
+			"you must call vyos_commit to apply it. Use vyos_config_exists first to verify " +
+			"the path exists if unsure. Idempotent: deleting a non-existent path is a no-op.",
+		Annotations: destructiveOp("Delete Configuration"),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, input pathInput) (*mcp.CallToolResult, any, error) {
 		if err := client.DeleteConfig(ctx, input.Path); err != nil {
 			return nil, nil, err
@@ -139,8 +188,12 @@ func registerTools(s *mcp.Server, client *VyosClient) {
 	})
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name:        "vyos_config_exists",
-		Description: "Check if a configuration path exists",
+		Name: "vyos_config_exists",
+		Description: "Check whether a configuration path exists in the active running configuration. " +
+			"Returns {\"exists\": true} if the path is present, {\"exists\": false} otherwise. " +
+			"Use this to verify configuration state before making changes or to confirm that " +
+			"a previous commit was applied correctly.",
+		Annotations: readOnly("Check Configuration Exists"),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, input pathInput) (*mcp.CallToolResult, any, error) {
 		exists, err := client.ConfigExists(ctx, input.Path)
 		if err != nil {
@@ -150,8 +203,12 @@ func registerTools(s *mcp.Server, client *VyosClient) {
 	})
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name:        "vyos_return_values",
-		Description: "Get values at a configuration path",
+		Name: "vyos_return_values",
+		Description: "Retrieve the values at a multi-value configuration path. " +
+			"Some VyOS config nodes hold multiple values (e.g., DNS nameservers, NTP servers). " +
+			"This returns all values as a string array. For single-value nodes, use vyos_show_config instead. " +
+			"Returns an empty array if the path has no values.",
+		Annotations: readOnly("Get Configuration Values"),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, input pathInput) (*mcp.CallToolResult, any, error) {
 		result, err := client.ReturnValues(ctx, input.Path)
 		if err != nil {
@@ -163,8 +220,20 @@ func registerTools(s *mcp.Server, client *VyosClient) {
 	// --- Config persistence ---
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name:        "vyos_commit",
-		Description: "Commit pending configuration changes",
+		Name: "vyos_commit",
+		Description: "Commit pending configuration changes to make them active on the router. " +
+			"All changes made via vyos_set_config, vyos_delete_config, or vyos_batch_config are staged " +
+			"in a candidate configuration until committed. Use confirmTimeout for a safety net: " +
+			"the router will auto-rollback to the previous config after the timeout unless vyos_confirm is called. " +
+			"This is critical for remote changes that could cause connectivity loss. " +
+			"After committing, use vyos_save_config to persist changes across reboots.",
+		Annotations: &mcp.ToolAnnotations{
+			Title:           "Commit Configuration",
+			ReadOnlyHint:    false,
+			DestructiveHint: boolPtr(false),
+			IdempotentHint:  false,
+			OpenWorldHint:   boolPtr(false),
+		},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, input commitInput) (*mcp.CallToolResult, any, error) {
 		if err := client.Commit(ctx, input.Comment, input.ConfirmTimeout); err != nil {
 			return nil, nil, err
@@ -173,8 +242,12 @@ func registerTools(s *mcp.Server, client *VyosClient) {
 	})
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name:        "vyos_confirm",
-		Description: "Confirm a pending commit-confirm, cancelling the auto-rollback",
+		Name: "vyos_confirm",
+		Description: "Confirm a pending commit-confirm operation, cancelling the scheduled auto-rollback. " +
+			"This must be called after a vyos_commit with confirmTimeout before the timeout expires. " +
+			"If not called in time, the router automatically reverts to the previous configuration. " +
+			"Only needed when commit was made with a confirmTimeout value.",
+		Annotations: writeOp("Confirm Commit"),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, input struct{}) (*mcp.CallToolResult, any, error) {
 		if err := client.Confirm(ctx); err != nil {
 			return nil, nil, err
@@ -183,8 +256,11 @@ func registerTools(s *mcp.Server, client *VyosClient) {
 	})
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name:        "vyos_save_config",
-		Description: "Save running configuration to startup config",
+		Name: "vyos_save_config",
+		Description: "Save the running configuration to the startup configuration file (/config/config.boot). " +
+			"Without saving, committed changes are lost on reboot. Call this after vyos_commit " +
+			"once you've verified the changes are working correctly.",
+		Annotations: writeOp("Save Configuration"),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, input struct{}) (*mcp.CallToolResult, any, error) {
 		if err := client.Save(ctx); err != nil {
 			return nil, nil, err
@@ -195,8 +271,14 @@ func registerTools(s *mcp.Server, client *VyosClient) {
 	// --- Operational commands ---
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name:        "vyos_show",
-		Description: "Run an operational show command",
+		Name: "vyos_show",
+		Description: "Run a VyOS operational-mode show command and return its output. " +
+			"This executes read-only operational commands (not configuration commands). " +
+			"The path represents the show command hierarchy — for example, " +
+			"[\"interfaces\"] runs \"show interfaces\", [\"ip\", \"route\"] runs \"show ip route\". " +
+			"Returns the command output as a string. Use this for any operational query " +
+			"not covered by a dedicated tool.",
+		Annotations: readOnly("Run Show Command"),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, input pathInput) (*mcp.CallToolResult, any, error) {
 		result, err := client.Show(ctx, input.Path)
 		if err != nil {
@@ -206,8 +288,13 @@ func registerTools(s *mcp.Server, client *VyosClient) {
 	})
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name:        "vyos_reset",
-		Description: "Run a reset command",
+		Name: "vyos_reset",
+		Description: "Run a VyOS operational-mode reset command. " +
+			"Resets operational state such as connections, counters, or peers — " +
+			"for example, [\"ip\", \"bgp\", \"neighbor\", \"192.168.1.1\"] resets a BGP session. " +
+			"This does NOT modify the saved configuration, but does affect running state. " +
+			"Use with caution as it can disrupt active sessions.",
+		Annotations: destructiveOp("Run Reset Command"),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, input pathInput) (*mcp.CallToolResult, any, error) {
 		result, err := client.Reset(ctx, input.Path)
 		if err != nil {
@@ -217,8 +304,18 @@ func registerTools(s *mcp.Server, client *VyosClient) {
 	})
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name:        "vyos_generate",
-		Description: "Run a generate command",
+		Name: "vyos_generate",
+		Description: "Run a VyOS operational-mode generate command. " +
+			"Used to generate cryptographic keys, PKI certificates, and other artifacts — " +
+			"for example, [\"pki\", \"key-pair\"] generates a new key pair. " +
+			"Returns the command output containing the generated data.",
+		Annotations: &mcp.ToolAnnotations{
+			Title:           "Run Generate Command",
+			ReadOnlyHint:    false,
+			DestructiveHint: boolPtr(false),
+			IdempotentHint:  false,
+			OpenWorldHint:   boolPtr(false),
+		},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, input pathInput) (*mcp.CallToolResult, any, error) {
 		result, err := client.Generate(ctx, input.Path)
 		if err != nil {
@@ -230,8 +327,12 @@ func registerTools(s *mcp.Server, client *VyosClient) {
 	// --- Convenience tools ---
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name:        "vyos_system_info",
-		Description: "Get system version, uptime, and resource usage",
+		Name: "vyos_system_info",
+		Description: "Retrieve the VyOS system version, hardware platform, build date, and architecture. " +
+			"Returns structured version information including the VyOS release string, " +
+			"underlying Linux kernel version, and system type. " +
+			"Use this to verify the router software version or check system identity.",
+		Annotations: readOnly("Get System Information"),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, input struct{}) (*mcp.CallToolResult, any, error) {
 		result, err := client.Show(ctx, []string{"version"})
 		if err != nil {
@@ -241,8 +342,16 @@ func registerTools(s *mcp.Server, client *VyosClient) {
 	})
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name:        "vyos_ping",
-		Description: "Ping a host from the router",
+		Name: "vyos_ping",
+		Description: "Send ICMP echo requests to a host from the router and return the results. " +
+			"Use this to test network reachability from the router's perspective, " +
+			"diagnose routing issues, or verify connectivity to upstream providers. " +
+			"Returns per-packet results and summary statistics (loss percentage, min/avg/max RTT).",
+		Annotations: &mcp.ToolAnnotations{
+			Title:         "Ping Host",
+			ReadOnlyHint:  true,
+			OpenWorldHint: boolPtr(true),
+		},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, input pingInput) (*mcp.CallToolResult, any, error) {
 		count := input.Count
 		if count <= 0 {
@@ -256,8 +365,16 @@ func registerTools(s *mcp.Server, client *VyosClient) {
 	})
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name:        "vyos_traceroute",
-		Description: "Traceroute to a host from the router",
+		Name: "vyos_traceroute",
+		Description: "Trace the network path from the router to a destination host, showing each hop. " +
+			"Use this to diagnose routing issues, identify where packets are being dropped, " +
+			"or understand the network path to a destination. Returns a list of intermediate " +
+			"routers with their IP addresses and round-trip times.",
+		Annotations: &mcp.ToolAnnotations{
+			Title:         "Traceroute to Host",
+			ReadOnlyHint:  true,
+			OpenWorldHint: boolPtr(true),
+		},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, input hostInput) (*mcp.CallToolResult, any, error) {
 		result, err := client.Traceroute(ctx, input.Host)
 		if err != nil {
@@ -267,8 +384,12 @@ func registerTools(s *mcp.Server, client *VyosClient) {
 	})
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name:        "vyos_interface_stats",
-		Description: "Show interface statistics",
+		Name: "vyos_interface_stats",
+		Description: "Retrieve status and traffic statistics for all network interfaces on the router. " +
+			"Returns interface names, link state (up/down), IP addresses, and packet/byte counters " +
+			"for both TX and RX. Use this to monitor interface health, check for errors, " +
+			"or verify link status after configuration changes.",
+		Annotations: readOnly("Show Interface Statistics"),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, input struct{}) (*mcp.CallToolResult, any, error) {
 		result, err := client.Show(ctx, []string{"interfaces"})
 		if err != nil {
@@ -278,8 +399,12 @@ func registerTools(s *mcp.Server, client *VyosClient) {
 	})
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name:        "vyos_routing_table",
-		Description: "Show routing table",
+		Name: "vyos_routing_table",
+		Description: "Retrieve the IPv4 routing table from the router's forwarding information base. " +
+			"Shows all active routes including connected, static, and dynamically learned routes " +
+			"with their next-hop addresses, outgoing interfaces, and route metrics. " +
+			"Use this to verify routing decisions, debug connectivity issues, or check route propagation.",
+		Annotations: readOnly("Show Routing Table"),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, input struct{}) (*mcp.CallToolResult, any, error) {
 		result, err := client.Show(ctx, []string{"ip", "route"})
 		if err != nil {
@@ -289,8 +414,13 @@ func registerTools(s *mcp.Server, client *VyosClient) {
 	})
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name:        "vyos_dhcp_leases",
-		Description: "Show DHCP server leases",
+		Name: "vyos_dhcp_leases",
+		Description: "List all active DHCP leases issued by the router's DHCP server. " +
+			"Returns lease details including assigned IP addresses, MAC addresses, hostnames, " +
+			"lease expiration times, and the DHCP pool each lease belongs to. " +
+			"Use this to identify connected devices, troubleshoot IP assignment issues, " +
+			"or audit network clients.",
+		Annotations: readOnly("Show DHCP Leases"),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, input struct{}) (*mcp.CallToolResult, any, error) {
 		result, err := client.Show(ctx, []string{"dhcp", "server", "leases"})
 		if err != nil {
@@ -300,8 +430,13 @@ func registerTools(s *mcp.Server, client *VyosClient) {
 	})
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name:        "vyos_health_check",
-		Description: "System health check: CPU, memory, storage, uptime",
+		Name: "vyos_health_check",
+		Description: "Run a comprehensive health check of the router, returning CPU usage, " +
+			"memory utilization, storage capacity, system uptime, and software version in a single call. " +
+			"Use this for routine monitoring, alerting on resource exhaustion, or as a quick " +
+			"system overview before making configuration changes. Returns a JSON object with " +
+			"keys: version, uptime, cpu, memory, storage.",
+		Annotations: readOnly("System Health Check"),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, input struct{}) (*mcp.CallToolResult, any, error) {
 		checks := map[string][]string{
 			"version": {"version"},

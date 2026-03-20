@@ -44,12 +44,12 @@ func destructiveOp(title string) *mcp.ToolAnnotations {
 // --- Input types ---
 
 type showConfigInput struct {
-	Path   []string `json:"path,omitempty" jsonschema:"Configuration path components to retrieve. Each element is one level of the config tree. Example: [interfaces, ethernet, eth0] retrieves the eth0 interface config. Omit for the full configuration tree."`
-	Format string   `json:"format,omitempty" jsonschema:"Output format for the configuration. Use json for structured data (default) or commands for VyOS set-style command output."`
+	Path   []string `json:"path,omitempty" jsonschema:"Configuration path components to retrieve. Each element is one level of the config tree. Example: ['interfaces', 'ethernet', 'eth0'] retrieves the eth0 interface config. Omit for the full configuration tree."`
+	Format string   `json:"format,omitempty" jsonschema:"Output format. Use 'json' for structured JSON data (default); any other value returns the raw cli-shell-api showConfig output."`
 }
 
 type pathInput struct {
-	Path []string `json:"path" jsonschema:"Path components where each element is one level of a VyOS hierarchy. For configuration tools this represents a config tree path; for operational tools it represents a command hierarchy. Example: [interfaces, ethernet, eth0] refers to the eth0 interface node."`
+	Path []string `json:"path" jsonschema:"Path components where each element is one level of a VyOS hierarchy. For configuration tools this represents a config tree path; for operational tools it represents a command hierarchy. Example: ['interfaces', 'ethernet', 'eth0'] refers to the eth0 interface node."`
 }
 
 type commitInput struct {
@@ -111,11 +111,11 @@ func registerTools(s *mcp.Server, client *VyosClient) {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "vyos_set_config",
-		Description: "Set a VyOS configuration value in the candidate configuration. " +
+		Description: "Set a VyOS configuration node in the candidate configuration. " +
 			"The change is staged but not yet active — you must call vyos_commit to apply it. " +
-			"The path represents the full configuration node including the value. " +
-			"For example, path [\"interfaces\", \"ethernet\", \"eth0\", \"description\", \"LAN\"] " +
-			"sets eth0's description to \"LAN\". Idempotent: setting the same value twice has no effect.",
+			"For nodes that take a value, the path includes the value as the final element; " +
+			"for valueless flag nodes (e.g., 'disable'), the path ends at the node name. " +
+			"Idempotent: setting the same value twice has no effect.",
 		Annotations: writeOp("Set Configuration"),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, input pathInput) (*mcp.CallToolResult, any, error) {
 		if err := client.SetConfig(ctx, input.Path); err != nil {
@@ -142,7 +142,7 @@ func registerTools(s *mcp.Server, client *VyosClient) {
 						"type": "object",
 						"properties": {
 							"op": {"type": "string", "enum": ["set", "delete"], "description": "The operation type: \"set\" to create or update a config node, \"delete\" to remove it."},
-							"path": {"type": "array", "items": {"type": "string"}, "description": "Configuration path components. Each element is one level of the VyOS config tree, with the final element being the value for set operations."}
+							"path": {"type": "array", "items": {"type": "string"}, "description": "Configuration path components. Each element is one level of the VyOS config tree; include the value as the final element when the node requires one."}
 						},
 						"required": ["op", "path"]
 					}

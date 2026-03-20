@@ -72,12 +72,12 @@ func readOnlyOpenWorld(title string) *mcp.ToolAnnotations {
 // --- Input types ---
 
 type showConfigInput struct {
-	Path   []string `json:"path,omitempty" jsonschema:"Configuration path components to retrieve. Each element is one level of the config tree. Example: ['interfaces', 'ethernet', 'eth0'] retrieves the eth0 interface config. Omit for the full configuration tree."`
+	Path   []string `json:"path,omitempty" jsonschema:"Configuration path components to retrieve. Each element is one level of the config tree, e.g. three elements: interfaces, ethernet, eth0. Omit for the full configuration tree."`
 	Format string   `json:"format,omitempty" jsonschema:"Output format. Use 'json' for structured JSON data (default); any other value returns the raw cli-shell-api showConfig output."`
 }
 
 type pathInput struct {
-	Path []string `json:"path" jsonschema:"Path components where each element is one level of a VyOS hierarchy. For configuration tools this represents a config tree path; for operational tools it represents a command hierarchy. Example: ['interfaces', 'ethernet', 'eth0'] refers to the eth0 interface node."`
+	Path []string `json:"path" jsonschema:"Path components where each element is one level of a VyOS hierarchy. For configuration tools this represents a config tree path; for operational tools it represents a command hierarchy, e.g. three elements: interfaces, ethernet, eth0."`
 }
 
 type commitInput struct {

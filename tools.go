@@ -41,6 +41,34 @@ func destructiveOp(title string) *mcp.ToolAnnotations {
 	}
 }
 
+func idempotentDestructiveOp(title string) *mcp.ToolAnnotations {
+	return &mcp.ToolAnnotations{
+		Title:           title,
+		ReadOnlyHint:    false,
+		DestructiveHint: boolPtr(true),
+		IdempotentHint:  true,
+		OpenWorldHint:   boolPtr(false),
+	}
+}
+
+func nonIdempotentWriteOp(title string) *mcp.ToolAnnotations {
+	return &mcp.ToolAnnotations{
+		Title:           title,
+		ReadOnlyHint:    false,
+		DestructiveHint: boolPtr(false),
+		IdempotentHint:  false,
+		OpenWorldHint:   boolPtr(false),
+	}
+}
+
+func readOnlyOpenWorld(title string) *mcp.ToolAnnotations {
+	return &mcp.ToolAnnotations{
+		Title:         title,
+		ReadOnlyHint:  true,
+		OpenWorldHint: boolPtr(true),
+	}
+}
+
 // --- Input types ---
 
 type showConfigInput struct {
@@ -179,13 +207,7 @@ func registerTools(s *mcp.Server, client *VyosClient) {
 			"Removes the specified config path and all its children. The change is staged — " +
 			"you must call vyos_commit to apply it. Use vyos_config_exists first to verify " +
 			"the path exists if unsure. Idempotent: deleting a non-existent path is a no-op.",
-		Annotations: &mcp.ToolAnnotations{
-			Title:           "Delete Configuration",
-			ReadOnlyHint:    false,
-			DestructiveHint: boolPtr(true),
-			IdempotentHint:  true,
-			OpenWorldHint:   boolPtr(false),
-		},
+		Annotations: idempotentDestructiveOp("Delete Configuration"),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, input pathInput) (*mcp.CallToolResult, any, error) {
 		if err := client.DeleteConfig(ctx, input.Path); err != nil {
 			return nil, nil, err
@@ -233,13 +255,7 @@ func registerTools(s *mcp.Server, client *VyosClient) {
 			"the router will auto-rollback to the previous config after the timeout unless vyos_confirm is called. " +
 			"This is critical for remote changes that could cause connectivity loss. " +
 			"After committing, use vyos_save_config to persist changes across reboots.",
-		Annotations: &mcp.ToolAnnotations{
-			Title:           "Commit Configuration",
-			ReadOnlyHint:    false,
-			DestructiveHint: boolPtr(false),
-			IdempotentHint:  false,
-			OpenWorldHint:   boolPtr(false),
-		},
+		Annotations: nonIdempotentWriteOp("Commit Configuration"),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, input commitInput) (*mcp.CallToolResult, any, error) {
 		if err := client.Commit(ctx, input.Comment, input.ConfirmTimeout); err != nil {
 			return nil, nil, err
@@ -253,13 +269,7 @@ func registerTools(s *mcp.Server, client *VyosClient) {
 			"This must be called after a vyos_commit with confirmTimeout before the timeout expires. " +
 			"If not called in time, the router automatically reverts to the previous configuration. " +
 			"Only needed when commit was made with a confirmTimeout value.",
-		Annotations: &mcp.ToolAnnotations{
-			Title:           "Confirm Commit",
-			ReadOnlyHint:    false,
-			DestructiveHint: boolPtr(false),
-			IdempotentHint:  false,
-			OpenWorldHint:   boolPtr(false),
-		},
+		Annotations: nonIdempotentWriteOp("Confirm Commit"),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, input struct{}) (*mcp.CallToolResult, any, error) {
 		if err := client.Confirm(ctx); err != nil {
 			return nil, nil, err
@@ -322,13 +332,7 @@ func registerTools(s *mcp.Server, client *VyosClient) {
 			"for example, [\"pki\", \"key-pair\"] generates a new key pair. " +
 			"Returns the command output containing the generated data, which may include " +
 			"sensitive cryptographic material.",
-		Annotations: &mcp.ToolAnnotations{
-			Title:           "Run Generate Command",
-			ReadOnlyHint:    false,
-			DestructiveHint: boolPtr(true),
-			IdempotentHint:  false,
-			OpenWorldHint:   boolPtr(false),
-		},
+		Annotations: destructiveOp("Run Generate Command"),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, input pathInput) (*mcp.CallToolResult, any, error) {
 		result, err := client.Generate(ctx, input.Path)
 		if err != nil {
@@ -360,11 +364,7 @@ func registerTools(s *mcp.Server, client *VyosClient) {
 			"Use this to test network reachability from the router's perspective, " +
 			"diagnose routing issues, or verify connectivity to upstream providers. " +
 			"Returns per-packet results and summary statistics (loss percentage, min/avg/max RTT).",
-		Annotations: &mcp.ToolAnnotations{
-			Title:         "Ping Host",
-			ReadOnlyHint:  true,
-			OpenWorldHint: boolPtr(true),
-		},
+		Annotations: readOnlyOpenWorld("Ping Host"),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, input pingInput) (*mcp.CallToolResult, any, error) {
 		count := input.Count
 		if count <= 0 {
@@ -383,11 +383,7 @@ func registerTools(s *mcp.Server, client *VyosClient) {
 			"Use this to diagnose routing issues, identify where packets are being dropped, " +
 			"or understand the network path to a destination. Returns a list of intermediate " +
 			"routers with their IP addresses and round-trip times.",
-		Annotations: &mcp.ToolAnnotations{
-			Title:         "Traceroute to Host",
-			ReadOnlyHint:  true,
-			OpenWorldHint: boolPtr(true),
-		},
+		Annotations: readOnlyOpenWorld("Traceroute to Host"),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, input hostInput) (*mcp.CallToolResult, any, error) {
 		result, err := client.Traceroute(ctx, input.Host)
 		if err != nil {

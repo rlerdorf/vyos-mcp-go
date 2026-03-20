@@ -44,12 +44,12 @@ func destructiveOp(title string) *mcp.ToolAnnotations {
 // --- Input types ---
 
 type showConfigInput struct {
-	Path   []string `json:"path,omitempty" jsonschema:"Configuration path components to retrieve. Each element is one level of the config tree. Example: [\"interfaces\", \"ethernet\", \"eth0\"] retrieves the eth0 interface config. Omit for the full configuration tree."`
-	Format string   `json:"format,omitempty" jsonschema:"Output format for the configuration. Use \"json\" for structured data (default) or \"commands\" for VyOS set-style command output."`
+	Path   []string `json:"path,omitempty" jsonschema:"Configuration path components to retrieve. Each element is one level of the config tree. Example: [interfaces, ethernet, eth0] retrieves the eth0 interface config. Omit for the full configuration tree."`
+	Format string   `json:"format,omitempty" jsonschema:"Output format for the configuration. Use json for structured data (default) or commands for VyOS set-style command output."`
 }
 
 type pathInput struct {
-	Path []string `json:"path" jsonschema:"Path components where each element is one level of a VyOS hierarchy. For configuration tools this represents a config tree path; for operational tools it represents a command hierarchy. Example: [\"interfaces\", \"ethernet\", \"eth0\"] refers to the eth0 interface node."`
+	Path []string `json:"path" jsonschema:"Path components where each element is one level of a VyOS hierarchy. For configuration tools this represents a config tree path; for operational tools it represents a command hierarchy. Example: [interfaces, ethernet, eth0] refers to the eth0 interface node."`
 }
 
 type commitInput struct {
@@ -131,7 +131,7 @@ func registerTools(s *mcp.Server, client *VyosClient) {
 			"Use this instead of multiple vyos_set_config/vyos_delete_config calls when making related changes " +
 			"that should succeed or fail together. Changes are staged in the candidate configuration — " +
 			"you must call vyos_commit to apply them. Each operation specifies \"set\" or \"delete\" and a path array.",
-		Annotations: writeOp("Batch Configuration"),
+		Annotations: destructiveOp("Batch Configuration"),
 		InputSchema: json.RawMessage(`{
 			"type": "object",
 			"properties": {
@@ -179,7 +179,13 @@ func registerTools(s *mcp.Server, client *VyosClient) {
 			"Removes the specified config path and all its children. The change is staged — " +
 			"you must call vyos_commit to apply it. Use vyos_config_exists first to verify " +
 			"the path exists if unsure. Idempotent: deleting a non-existent path is a no-op.",
-		Annotations: destructiveOp("Delete Configuration"),
+		Annotations: &mcp.ToolAnnotations{
+			Title:           "Delete Configuration",
+			ReadOnlyHint:    false,
+			DestructiveHint: boolPtr(true),
+			IdempotentHint:  true,
+			OpenWorldHint:   boolPtr(false),
+		},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, input pathInput) (*mcp.CallToolResult, any, error) {
 		if err := client.DeleteConfig(ctx, input.Path); err != nil {
 			return nil, nil, err

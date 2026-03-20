@@ -9,7 +9,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// --- Helpers ---
+// --- Annotation helpers ---
 
 func boolPtr(b bool) *bool { return &b }
 
@@ -36,7 +36,7 @@ func destructiveOp(title string) *mcp.ToolAnnotations {
 		Title:           title,
 		ReadOnlyHint:    false,
 		DestructiveHint: boolPtr(true),
-		IdempotentHint:  true,
+		IdempotentHint:  false,
 		OpenWorldHint:   boolPtr(false),
 	}
 }
@@ -49,7 +49,7 @@ type showConfigInput struct {
 }
 
 type pathInput struct {
-	Path []string `json:"path" jsonschema:"Configuration path components, where each element is one level of the VyOS config tree. Example: [\"interfaces\", \"ethernet\", \"eth0\", \"description\", \"WAN\"] sets the description of eth0 to WAN."`
+	Path []string `json:"path" jsonschema:"Path components where each element is one level of a VyOS hierarchy. For configuration tools this represents a config tree path; for operational tools it represents a command hierarchy. Example: [\"interfaces\", \"ethernet\", \"eth0\"] refers to the eth0 interface node."`
 }
 
 type commitInput struct {
@@ -63,10 +63,10 @@ type hostInput struct {
 
 type pingInput struct {
 	Host  string `json:"host" jsonschema:"Target hostname or IP address (IPv4 or IPv6) to ping from the router."`
-	Count int    `json:"count,omitempty" jsonschema:"Number of ICMP echo requests to send. Defaults to 5 if omitted. Maximum recommended value is 20 to avoid long waits."`
+	Count int    `json:"count,omitempty" jsonschema:"Number of ICMP echo requests to send. Defaults to 5 if omitted. Very large values may result in long waits before the command completes."`
 }
 
-// --- Helpers ---
+// --- Result helpers ---
 
 func textResult(v any) (*mcp.CallToolResult, any, error) {
 	data, err := json.MarshalIndent(v, "", "  ")
@@ -247,7 +247,13 @@ func registerTools(s *mcp.Server, client *VyosClient) {
 			"This must be called after a vyos_commit with confirmTimeout before the timeout expires. " +
 			"If not called in time, the router automatically reverts to the previous configuration. " +
 			"Only needed when commit was made with a confirmTimeout value.",
-		Annotations: writeOp("Confirm Commit"),
+		Annotations: &mcp.ToolAnnotations{
+			Title:           "Confirm Commit",
+			ReadOnlyHint:    false,
+			DestructiveHint: boolPtr(false),
+			IdempotentHint:  false,
+			OpenWorldHint:   boolPtr(false),
+		},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, input struct{}) (*mcp.CallToolResult, any, error) {
 		if err := client.Confirm(ctx); err != nil {
 			return nil, nil, err
@@ -308,11 +314,12 @@ func registerTools(s *mcp.Server, client *VyosClient) {
 		Description: "Run a VyOS operational-mode generate command. " +
 			"Used to generate cryptographic keys, PKI certificates, and other artifacts — " +
 			"for example, [\"pki\", \"key-pair\"] generates a new key pair. " +
-			"Returns the command output containing the generated data.",
+			"Returns the command output containing the generated data, which may include " +
+			"sensitive cryptographic material.",
 		Annotations: &mcp.ToolAnnotations{
 			Title:           "Run Generate Command",
 			ReadOnlyHint:    false,
-			DestructiveHint: boolPtr(false),
+			DestructiveHint: boolPtr(true),
 			IdempotentHint:  false,
 			OpenWorldHint:   boolPtr(false),
 		},

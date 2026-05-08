@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"regexp"
@@ -52,7 +53,8 @@ func NewVyosClient() (*VyosClient, error) {
 	}
 
 	// Parse session env output (format: VAR=value; or declare -x VAR=value)
-	re := regexp.MustCompile(`([A-Z_]+)=(/[^;\s]+)`)
+	// Use [^;\s]* (not +) to capture bare "/" values like VYATTA_EDIT_LEVEL=/
+	re := regexp.MustCompile(`([A-Z_]+)=(/[^;\s]*)`)
 	for _, match := range re.FindAllStringSubmatch(string(out), -1) {
 		envMap[match[1]] = match[2]
 	}
@@ -113,10 +115,11 @@ func (c *VyosClient) Close() {
 	c.runSilent(context.Background(), cliShellAPI, "teardownSession")
 }
 
-// run executes a command with the session environment and returns stdout.
-func (c *VyosClient) run(ctx context.Context, name string, args ...string) (string, error) {
+// runWithStdin executes a command with the session environment, optional stdin, and returns stdout.
+func (c *VyosClient) runWithStdin(ctx context.Context, stdin io.Reader, name string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Env = c.sessionEnv
+	cmd.Stdin = stdin
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -131,6 +134,11 @@ func (c *VyosClient) run(ctx context.Context, name string, args ...string) (stri
 		return "", fmt.Errorf("%s: %w", name, err)
 	}
 	return stdout.String(), nil
+}
+
+// run executes a command with the session environment and returns stdout.
+func (c *VyosClient) run(ctx context.Context, name string, args ...string) (string, error) {
+	return c.runWithStdin(ctx, nil, name, args...)
 }
 
 // runSilent executes a command, discarding output.
@@ -154,30 +162,36 @@ func (c *VyosClient) ShowConfig(ctx context.Context, path []string, format strin
 }
 
 func (c *VyosClient) showConfigJSON(ctx context.Context, path []string) (any, error) {
-	// Convert config.boot to JSON
-	out, err := c.run(ctx, configToJSON, configBoot)
+	// Read the active (committed) config via cli-shell-api showConfig, which
+	// always reflects the current running state regardless of whether save was called.
+	raw, err := c.run(ctx, cliShellAPI, append([]string{"showConfig"}, path...)...)
+	if err != nil {
+		return nil, err
+	}
+
+	// Pipe VyOS config format through vyos-config-to-json via stdin.
+	out, err := c.runWithStdin(ctx, strings.NewReader(raw), configToJSON)
 	if err != nil {
 		return nil, fmt.Errorf("config-to-json: %w", err)
 	}
 
-	var config any
-	if err := json.Unmarshal([]byte(out), &config); err != nil {
+	var result any
+	if err := json.Unmarshal([]byte(out), &result); err != nil {
 		return nil, fmt.Errorf("parse config JSON: %w", err)
 	}
 
-	// Navigate to the requested path
-	current := config
-	for _, key := range path {
-		m, ok := current.(map[string]any)
-		if !ok {
-			return nil, fmt.Errorf("path not found: %s", strings.Join(path, " "))
-		}
-		current, ok = m[key]
-		if !ok {
-			return nil, fmt.Errorf("path not found: %s", strings.Join(path, " "))
+	// cli-shell-api showConfig for tagged node types (e.g. "remote") includes the
+	// final path key as a wrapper in the output. Unwrap it to preserve the API
+	// contract: callers expect the subtree value at path, not {lastKey: value}.
+	if len(path) > 0 {
+		if m, ok := result.(map[string]any); ok {
+			lastKey := path[len(path)-1]
+			if val, ok := m[lastKey]; ok && len(m) == 1 {
+				return val, nil
+			}
 		}
 	}
-	return current, nil
+	return result, nil
 }
 
 func (c *VyosClient) ConfigExists(ctx context.Context, path []string) (bool, error) {

@@ -52,7 +52,8 @@ func NewVyosClient() (*VyosClient, error) {
 	}
 
 	// Parse session env output (format: VAR=value; or declare -x VAR=value)
-	re := regexp.MustCompile(`([A-Z_]+)=(/[^;\s]+)`)
+	// Use [^;\s]* (not +) to capture bare "/" values like VYATTA_EDIT_LEVEL=/
+	re := regexp.MustCompile(`([A-Z_]+)=(/[^;\s]*)`)
 	for _, match := range re.FindAllStringSubmatch(string(out), -1) {
 		envMap[match[1]] = match[2]
 	}
@@ -154,30 +155,34 @@ func (c *VyosClient) ShowConfig(ctx context.Context, path []string, format strin
 }
 
 func (c *VyosClient) showConfigJSON(ctx context.Context, path []string) (any, error) {
-	// Convert config.boot to JSON
-	out, err := c.run(ctx, configToJSON, configBoot)
+	// Read the active (committed) config via cli-shell-api showConfig, which
+	// always reflects the current running state regardless of whether save was called.
+	// showConfig [path] returns the subtree contents at path (no wrapper key).
+	raw, err := c.run(ctx, cliShellAPI, append([]string{"showConfig"}, path...)...)
 	if err != nil {
-		return nil, fmt.Errorf("config-to-json: %w", err)
+		return nil, err
 	}
 
-	var config any
-	if err := json.Unmarshal([]byte(out), &config); err != nil {
+	// Pipe VyOS config format through vyos-config-to-json via stdin
+	cmd := exec.CommandContext(ctx, configToJSON)
+	cmd.Env = c.sessionEnv
+	cmd.Stdin = strings.NewReader(raw)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			msg = strings.TrimSpace(stdout.String())
+		}
+		return nil, fmt.Errorf("config-to-json: %s: %w", msg, err)
+	}
+
+	var result any
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
 		return nil, fmt.Errorf("parse config JSON: %w", err)
 	}
-
-	// Navigate to the requested path
-	current := config
-	for _, key := range path {
-		m, ok := current.(map[string]any)
-		if !ok {
-			return nil, fmt.Errorf("path not found: %s", strings.Join(path, " "))
-		}
-		current, ok = m[key]
-		if !ok {
-			return nil, fmt.Errorf("path not found: %s", strings.Join(path, " "))
-		}
-	}
-	return current, nil
+	return result, nil
 }
 
 func (c *VyosClient) ConfigExists(ctx context.Context, path []string) (bool, error) {

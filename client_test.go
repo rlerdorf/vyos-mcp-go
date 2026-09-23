@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"os/exec"
 	"strings"
 	"testing"
 )
@@ -42,5 +44,44 @@ func TestParseBatchRejectsBeforeApplying(t *testing.T) {
 		if !strings.HasPrefix(err.Error(), "operation 3:") {
 			t.Errorf("%s: error should name operation 3, got %q", name, err)
 		}
+	}
+}
+
+// Only exit 1 means "no changes"; any other failure must surface as an error,
+// or Commit reports "no staged changes" and BatchConfigure misreports what a
+// rollback discarded.
+func TestSessionChangedResult(t *testing.T) {
+	run := func(ctx context.Context, code string) error {
+		return exec.CommandContext(ctx, "sh", "-c", "exit "+code).Run()
+	}
+	bg := context.Background()
+
+	if changed, err := sessionChangedResult(run(bg, "0")); !changed || err != nil {
+		t.Errorf("exit 0: want (true, nil), got (%v, %v)", changed, err)
+	}
+	if changed, err := sessionChangedResult(run(bg, "1")); changed || err != nil {
+		t.Errorf("exit 1: want (false, nil), got (%v, %v)", changed, err)
+	}
+	if _, err := sessionChangedResult(run(bg, "2")); err == nil {
+		t.Error("exit 2: want an error, got nil")
+	}
+	cancelled, cancel := context.WithCancel(bg)
+	cancel()
+	if _, err := sessionChangedResult(run(cancelled, "0")); err == nil {
+		t.Error("cancelled context: want an error, got nil")
+	}
+	if _, err := sessionChangedResult(exec.Command("/nonexistent/cli-shell-api").Run()); err == nil {
+		t.Error("missing binary: want an error, got nil")
+	}
+}
+
+// The rollback context must outlive a cancelled request.
+func TestDiscardContextSurvivesCancelledRequest(t *testing.T) {
+	req, cancel := context.WithCancel(context.Background())
+	cancel()
+	cleanup, stop := context.WithTimeout(context.WithoutCancel(req), discardTimeout)
+	defer stop()
+	if err := exec.CommandContext(cleanup, "true").Run(); err != nil {
+		t.Fatalf("cleanup command did not run after request cancellation: %v", err)
 	}
 }

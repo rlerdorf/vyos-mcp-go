@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // VyOS CLI tool paths
@@ -290,12 +292,31 @@ func parseBatch(operations []map[string]any) ([]batchOp, error) {
 }
 
 // sessionChanged reports whether the config session has uncommitted changes.
-// cli-shell-api sessionChanged exits 0 when it does, 1 when it does not.
-func (c *VyosClient) sessionChanged(ctx context.Context) bool {
+func (c *VyosClient) sessionChanged(ctx context.Context) (bool, error) {
 	cmd := exec.CommandContext(ctx, cliShellAPI, "sessionChanged")
 	cmd.Env = c.sessionEnv
-	return cmd.Run() == nil
+	return sessionChangedResult(cmd.Run())
 }
+
+// sessionChangedResult interprets `cli-shell-api sessionChanged`: exit 0 means
+// changes are staged, exit 1 means none. Anything else -- a broken session, a
+// permission error, a cancelled context -- is an error, not "no changes".
+func sessionChangedResult(err error) (bool, error) {
+	if err == nil {
+		return true, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, fmt.Errorf("cannot determine config session state: %w", err)
+}
+
+// discardTimeout bounds the rollback in BatchConfigure. It runs on its own
+// context: if the batch failed because the request was cancelled, the
+// request context is already dead and would stop the discard from running,
+// leaving the partial batch staged for the next commit.
+const discardTimeout = 30 * time.Second
 
 // BatchConfigure applies all operations or none. my_set/my_delete stage one
 // change at a time, so on the first failure the whole session is discarded
@@ -311,11 +332,20 @@ func (c *VyosClient) BatchConfigure(ctx context.Context, operations []map[string
 	c.configMu.Lock()
 	defer c.configMu.Unlock()
 
-	hadPending := c.sessionChanged(ctx)
+	// Without knowing whether changes were already staged, a rollback could
+	// not report what it discarded; a session this broken should not take a
+	// batch at all.
+	hadPending, err := c.sessionChanged(ctx)
+	if err != nil {
+		return fmt.Errorf("batch rejected, nothing applied: %w", err)
+	}
 	for i, op := range ops {
 		if err := c.runSilent(ctx, op.cmd, op.path...); err != nil {
 			msg := fmt.Sprintf("operation %d (%s %s) failed: %v", i+1, op.name, strings.Join(op.path, " "), err)
-			if derr := c.runSilent(ctx, myDiscard); derr != nil {
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), discardTimeout)
+			derr := c.runSilent(cleanupCtx, myDiscard)
+			cancel()
+			if derr != nil {
 				return fmt.Errorf("%s; discarding the partial batch ALSO failed (%v): "+
 					"operations 1-%d may still be staged, do not commit", msg, derr, i)
 			}
@@ -341,7 +371,11 @@ func (c *VyosClient) Commit(ctx context.Context, comment *string, confirmTimeout
 
 	// my_commit exits 0 with nothing staged, which would report success for a
 	// commit that applied nothing -- e.g. right after a batch was rolled back.
-	if !c.sessionChanged(ctx) {
+	changed, err := c.sessionChanged(ctx)
+	if err != nil {
+		return err
+	}
+	if !changed {
 		return fmt.Errorf("no staged changes to commit")
 	}
 

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"os/exec"
 	"strings"
 	"testing"
@@ -72,6 +73,28 @@ func TestSessionChangedResult(t *testing.T) {
 	}
 	if _, err := sessionChangedResult(exec.Command("/nonexistent/cli-shell-api").Run()); err == nil {
 		t.Error("missing binary: want an error, got nil")
+	}
+}
+
+// An empty batch, or one whose "operations" field is missing (nil), must be
+// rejected rather than reported as applied.
+func TestParseBatchRejectsEmpty(t *testing.T) {
+	for name, operations := range map[string][]map[string]any{
+		"empty list":    {},
+		"missing field": nil,
+	} {
+		if ops, err := parseBatch(operations); err == nil || ops != nil {
+			t.Errorf("%s: want error and no ops, got ops=%v err=%v", name, ops, err)
+		}
+	}
+	var args struct {
+		Operations []map[string]any `json:"operations"`
+	}
+	if err := json.Unmarshal([]byte(`{"ops":[{"op":"set","path":["a"]}]}`), &args); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := parseBatch(args.Operations); err == nil {
+		t.Error("misnamed field: want error, got nil")
 	}
 }
 

@@ -262,6 +262,11 @@ type batchOp struct {
 // parseBatch validates every operation up front, so a malformed entry late in
 // the list cannot leave the earlier ones applied.
 func parseBatch(operations []map[string]any) ([]batchOp, error) {
+	// A missing "operations" field unmarshals to nil. Reporting success for
+	// it would tell a caller that misnamed the field its changes were staged.
+	if len(operations) == 0 {
+		return nil, fmt.Errorf("no operations given")
+	}
 	ops := make([]batchOp, 0, len(operations))
 	for i, op := range operations {
 		opStr, _ := op["op"].(string)
@@ -347,7 +352,8 @@ func (c *VyosClient) BatchConfigure(ctx context.Context, operations []map[string
 			cancel()
 			if derr != nil {
 				return fmt.Errorf("%s; discarding the partial batch ALSO failed (%v): "+
-					"operations 1-%d may still be staged, do not commit", msg, derr, i)
+					"operations 1 through %d (the failed one included) may still be staged, do not commit",
+					msg, derr, i+1)
 			}
 			if hadPending {
 				return fmt.Errorf("%s; batch rolled back by discarding the session, "+

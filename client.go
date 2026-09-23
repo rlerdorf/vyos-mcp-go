@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // VyOS CLI tool paths
@@ -19,6 +21,7 @@ const (
 	cliShellAPI  = "/bin/cli-shell-api"
 	mySet        = "/opt/vyatta/sbin/my_set"
 	myDelete     = "/opt/vyatta/sbin/my_delete"
+	myDiscard    = "/opt/vyatta/sbin/my_discard"
 	myCommit     = "/opt/vyatta/sbin/my_commit"
 	configMgmt   = "/usr/bin/config-mgmt"
 	opCmdWrapper = "/opt/vyatta/bin/vyatta-op-cmd-wrapper"
@@ -250,16 +253,23 @@ func (c *VyosClient) SetConfig(ctx context.Context, path []string) error {
 	return c.runSilent(ctx, mySet, path...)
 }
 
-func (c *VyosClient) BatchConfigure(ctx context.Context, operations []map[string]any) error {
-	c.configMu.Lock()
-	defer c.configMu.Unlock()
-	for _, op := range operations {
+type batchOp struct {
+	cmd  string
+	name string
+	path []string
+}
+
+// parseBatch validates every operation up front, so a malformed entry late in
+// the list cannot leave the earlier ones applied.
+func parseBatch(operations []map[string]any) ([]batchOp, error) {
+	// A missing "operations" field unmarshals to nil. Reporting success for
+	// it would tell a caller that misnamed the field its changes were staged.
+	if len(operations) == 0 {
+		return nil, fmt.Errorf("no operations given")
+	}
+	ops := make([]batchOp, 0, len(operations))
+	for i, op := range operations {
 		opStr, _ := op["op"].(string)
-		pathAny, _ := op["path"].([]any)
-		path := make([]string, len(pathAny))
-		for i, p := range pathAny {
-			path[i], _ = p.(string)
-		}
 		var cmd string
 		switch opStr {
 		case "set":
@@ -267,10 +277,89 @@ func (c *VyosClient) BatchConfigure(ctx context.Context, operations []map[string
 		case "delete":
 			cmd = myDelete
 		default:
-			return fmt.Errorf("unknown operation: %s", opStr)
+			return nil, fmt.Errorf("operation %d: unknown op %q (want \"set\" or \"delete\")", i+1, opStr)
 		}
-		if err := c.runSilent(ctx, cmd, path...); err != nil {
-			return err
+		pathAny, ok := op["path"].([]any)
+		if !ok || len(pathAny) == 0 {
+			return nil, fmt.Errorf("operation %d: path must be a non-empty array of strings", i+1)
+		}
+		path := make([]string, len(pathAny))
+		for j, p := range pathAny {
+			s, ok := p.(string)
+			if !ok {
+				return nil, fmt.Errorf("operation %d: path element %d is not a string", i+1, j+1)
+			}
+			path[j] = s
+		}
+		ops = append(ops, batchOp{cmd: cmd, name: opStr, path: path})
+	}
+	return ops, nil
+}
+
+// sessionChanged reports whether the config session has uncommitted changes.
+func (c *VyosClient) sessionChanged(ctx context.Context) (bool, error) {
+	cmd := exec.CommandContext(ctx, cliShellAPI, "sessionChanged")
+	cmd.Env = c.sessionEnv
+	return sessionChangedResult(cmd.Run())
+}
+
+// sessionChangedResult interprets `cli-shell-api sessionChanged`: exit 0 means
+// changes are staged, exit 1 means none. Anything else -- a broken session, a
+// permission error, a cancelled context -- is an error, not "no changes".
+func sessionChangedResult(err error) (bool, error) {
+	if err == nil {
+		return true, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, fmt.Errorf("cannot determine config session state: %w", err)
+}
+
+// discardTimeout bounds the rollback in BatchConfigure. It runs on its own
+// context: if the batch failed because the request was cancelled, the
+// request context is already dead and would stop the discard from running,
+// leaving the partial batch staged for the next commit.
+const discardTimeout = 30 * time.Second
+
+// BatchConfigure applies all operations or none. my_set/my_delete stage one
+// change at a time, so on the first failure the whole session is discarded
+// (as the VyOS HTTP API does) rather than leaving earlier operations staged
+// for the next commit to apply. The session is long-lived, so anything staged
+// before the batch is discarded too, and the error says so.
+func (c *VyosClient) BatchConfigure(ctx context.Context, operations []map[string]any) error {
+	ops, err := parseBatch(operations)
+	if err != nil {
+		return fmt.Errorf("batch rejected, nothing applied: %w", err)
+	}
+
+	c.configMu.Lock()
+	defer c.configMu.Unlock()
+
+	// Without knowing whether changes were already staged, a rollback could
+	// not report what it discarded; a session this broken should not take a
+	// batch at all.
+	hadPending, err := c.sessionChanged(ctx)
+	if err != nil {
+		return fmt.Errorf("batch rejected, nothing applied: %w", err)
+	}
+	for i, op := range ops {
+		if err := c.runSilent(ctx, op.cmd, op.path...); err != nil {
+			msg := fmt.Sprintf("operation %d (%s %s) failed: %v", i+1, op.name, strings.Join(op.path, " "), err)
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), discardTimeout)
+			derr := c.runSilent(cleanupCtx, myDiscard)
+			cancel()
+			if derr != nil {
+				return fmt.Errorf("%s; discarding the partial batch ALSO failed (%v): "+
+					"operations 1 through %d (the failed one included) may still be staged, do not commit",
+					msg, derr, i+1)
+			}
+			if hadPending {
+				return fmt.Errorf("%s; batch rolled back by discarding the session, "+
+					"which also discarded changes staged before this batch: re-apply them", msg)
+			}
+			return fmt.Errorf("%s; batch rolled back, nothing is staged", msg)
 		}
 	}
 	return nil
@@ -285,6 +374,16 @@ func (c *VyosClient) DeleteConfig(ctx context.Context, path []string) error {
 func (c *VyosClient) Commit(ctx context.Context, comment *string, confirmTimeout *int) error {
 	c.configMu.Lock()
 	defer c.configMu.Unlock()
+
+	// my_commit exits 0 with nothing staged, which would report success for a
+	// commit that applied nothing -- e.g. right after a batch was rolled back.
+	changed, err := c.sessionChanged(ctx)
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return fmt.Errorf("no staged changes to commit")
+	}
 
 	// Always commit first
 	if err := c.runSilent(ctx, myCommit); err != nil {

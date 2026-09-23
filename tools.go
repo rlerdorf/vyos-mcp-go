@@ -155,10 +155,13 @@ func registerTools(s *mcp.Server, client *VyosClient) {
 	// vyos_batch_config uses raw AddTool for complex array-of-objects schema
 	s.AddTool(&mcp.Tool{
 		Name: "vyos_batch_config",
-		Description: "Set or delete multiple configuration values in a single atomic operation. " +
+		Description: "Set or delete multiple configuration values as one all-or-nothing batch. " +
 			"Use this instead of multiple vyos_set_config/vyos_delete_config calls when making related changes " +
-			"that should succeed or fail together. Changes are staged in the candidate configuration — " +
-			"you must call vyos_commit to apply them. Each operation specifies \"set\" or \"delete\" and a path array.",
+			"that should succeed or fail together. All operations are validated first; if any operation fails " +
+			"while applying, the session is discarded so nothing from the batch stays staged (this also discards " +
+			"anything staged before the batch, and the error says so). Changes are staged in the candidate " +
+			"configuration — call vyos_commit only after this returns success, never in parallel with it. " +
+			"Each operation specifies \"set\" or \"delete\" and a path array.",
 		Annotations: destructiveOp("Batch Configuration"),
 		InputSchema: json.RawMessage(`{
 			"type": "object",
@@ -254,7 +257,8 @@ func registerTools(s *mcp.Server, client *VyosClient) {
 			"in a candidate configuration until committed. Use confirmTimeout for a safety net: " +
 			"the router will auto-rollback to the previous config after the timeout unless vyos_confirm is called. " +
 			"This is critical for remote changes that could cause connectivity loss. " +
-			"After committing, use vyos_save_config to persist changes across reboots.",
+			"After committing, use vyos_save_config to persist changes across reboots. " +
+			"Returns an error if nothing is staged, rather than reporting a commit that applied nothing.",
 		Annotations: nonIdempotentWriteOp("Commit Configuration"),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, input commitInput) (*mcp.CallToolResult, any, error) {
 		if err := client.Commit(ctx, input.Comment, input.ConfirmTimeout); err != nil {

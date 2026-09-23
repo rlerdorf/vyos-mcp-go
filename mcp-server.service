@@ -8,7 +8,9 @@ ExecStart=/config/user-data/vyos-mcp-go
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=yes
-PrivateTmp=yes
+# No PrivateTmp: VyOS signals boot completion with /tmp/vyos-config-status.
+# With a private /tmp the vyos Python library thinks boot never finished, sees
+# an empty running config, and vyos-save-config.py exits 0 without writing.
 
 [Install]
 WantedBy=multi-user.target

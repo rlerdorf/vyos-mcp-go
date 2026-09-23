@@ -45,7 +45,7 @@ By binding to localhost, the only way to reach the server is through an SSH tunn
 ### Other measures
 
 - The SSH tunnel inherits your existing SSH key authentication and encryption
-- The systemd service runs with `NoNewPrivileges=yes` and `PrivateTmp=yes`
+- The systemd service runs with `NoNewPrivileges=yes`. It deliberately does not use `PrivateTmp`: VyOS tools read `/tmp/vyos-config-status` to tell whether boot has finished, and with a private `/tmp` saving the config silently does nothing
 - Config-modifying operations are serialized with a mutex to prevent race conditions
 
 ## Prerequisites

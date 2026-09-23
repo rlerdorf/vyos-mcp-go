@@ -329,7 +329,25 @@ func (c *VyosClient) Confirm(ctx context.Context) error {
 func (c *VyosClient) Save(ctx context.Context) error {
 	c.configMu.Lock()
 	defer c.configMu.Unlock()
-	return c.runSilent(ctx, saveConfigPy, configBoot)
+
+	// vyos-save-config.py exits 0 without writing anything when it can't see
+	// a running config (e.g. /tmp/vyos-config-status not visible), so check
+	// that config.boot was actually rewritten rather than trusting the exit code.
+	before, err := os.Stat(configBoot)
+	if err != nil {
+		return fmt.Errorf("stat %s: %w", configBoot, err)
+	}
+	if err := c.runSilent(ctx, saveConfigPy, configBoot); err != nil {
+		return err
+	}
+	after, err := os.Stat(configBoot)
+	if err != nil {
+		return fmt.Errorf("stat %s: %w", configBoot, err)
+	}
+	if !after.ModTime().After(before.ModTime()) && os.SameFile(before, after) {
+		return fmt.Errorf("%s exited successfully but %s was not rewritten", saveConfigPy, configBoot)
+	}
+	return nil
 }
 
 // --- Operational commands ---

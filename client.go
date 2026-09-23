@@ -19,6 +19,7 @@ const (
 	cliShellAPI  = "/bin/cli-shell-api"
 	mySet        = "/opt/vyatta/sbin/my_set"
 	myDelete     = "/opt/vyatta/sbin/my_delete"
+	myDiscard    = "/opt/vyatta/sbin/my_discard"
 	myCommit     = "/opt/vyatta/sbin/my_commit"
 	configMgmt   = "/usr/bin/config-mgmt"
 	opCmdWrapper = "/opt/vyatta/bin/vyatta-op-cmd-wrapper"
@@ -250,16 +251,18 @@ func (c *VyosClient) SetConfig(ctx context.Context, path []string) error {
 	return c.runSilent(ctx, mySet, path...)
 }
 
-func (c *VyosClient) BatchConfigure(ctx context.Context, operations []map[string]any) error {
-	c.configMu.Lock()
-	defer c.configMu.Unlock()
-	for _, op := range operations {
+type batchOp struct {
+	cmd  string
+	name string
+	path []string
+}
+
+// parseBatch validates every operation up front, so a malformed entry late in
+// the list cannot leave the earlier ones applied.
+func parseBatch(operations []map[string]any) ([]batchOp, error) {
+	ops := make([]batchOp, 0, len(operations))
+	for i, op := range operations {
 		opStr, _ := op["op"].(string)
-		pathAny, _ := op["path"].([]any)
-		path := make([]string, len(pathAny))
-		for i, p := range pathAny {
-			path[i], _ = p.(string)
-		}
 		var cmd string
 		switch opStr {
 		case "set":
@@ -267,10 +270,60 @@ func (c *VyosClient) BatchConfigure(ctx context.Context, operations []map[string
 		case "delete":
 			cmd = myDelete
 		default:
-			return fmt.Errorf("unknown operation: %s", opStr)
+			return nil, fmt.Errorf("operation %d: unknown op %q (want \"set\" or \"delete\")", i+1, opStr)
 		}
-		if err := c.runSilent(ctx, cmd, path...); err != nil {
-			return err
+		pathAny, ok := op["path"].([]any)
+		if !ok || len(pathAny) == 0 {
+			return nil, fmt.Errorf("operation %d: path must be a non-empty array of strings", i+1)
+		}
+		path := make([]string, len(pathAny))
+		for j, p := range pathAny {
+			s, ok := p.(string)
+			if !ok {
+				return nil, fmt.Errorf("operation %d: path element %d is not a string", i+1, j+1)
+			}
+			path[j] = s
+		}
+		ops = append(ops, batchOp{cmd: cmd, name: opStr, path: path})
+	}
+	return ops, nil
+}
+
+// sessionChanged reports whether the config session has uncommitted changes.
+// cli-shell-api sessionChanged exits 0 when it does, 1 when it does not.
+func (c *VyosClient) sessionChanged(ctx context.Context) bool {
+	cmd := exec.CommandContext(ctx, cliShellAPI, "sessionChanged")
+	cmd.Env = c.sessionEnv
+	return cmd.Run() == nil
+}
+
+// BatchConfigure applies all operations or none. my_set/my_delete stage one
+// change at a time, so on the first failure the whole session is discarded
+// (as the VyOS HTTP API does) rather than leaving earlier operations staged
+// for the next commit to apply. The session is long-lived, so anything staged
+// before the batch is discarded too, and the error says so.
+func (c *VyosClient) BatchConfigure(ctx context.Context, operations []map[string]any) error {
+	ops, err := parseBatch(operations)
+	if err != nil {
+		return fmt.Errorf("batch rejected, nothing applied: %w", err)
+	}
+
+	c.configMu.Lock()
+	defer c.configMu.Unlock()
+
+	hadPending := c.sessionChanged(ctx)
+	for i, op := range ops {
+		if err := c.runSilent(ctx, op.cmd, op.path...); err != nil {
+			msg := fmt.Sprintf("operation %d (%s %s) failed: %v", i+1, op.name, strings.Join(op.path, " "), err)
+			if derr := c.runSilent(ctx, myDiscard); derr != nil {
+				return fmt.Errorf("%s; discarding the partial batch ALSO failed (%v): "+
+					"operations 1-%d may still be staged, do not commit", msg, derr, i)
+			}
+			if hadPending {
+				return fmt.Errorf("%s; batch rolled back by discarding the session, "+
+					"which also discarded changes staged before this batch: re-apply them", msg)
+			}
+			return fmt.Errorf("%s; batch rolled back, nothing is staged", msg)
 		}
 	}
 	return nil
@@ -285,6 +338,12 @@ func (c *VyosClient) DeleteConfig(ctx context.Context, path []string) error {
 func (c *VyosClient) Commit(ctx context.Context, comment *string, confirmTimeout *int) error {
 	c.configMu.Lock()
 	defer c.configMu.Unlock()
+
+	// my_commit exits 0 with nothing staged, which would report success for a
+	// commit that applied nothing -- e.g. right after a batch was rolled back.
+	if !c.sessionChanged(ctx) {
+		return fmt.Errorf("no staged changes to commit")
+	}
 
 	// Always commit first
 	if err := c.runSilent(ctx, myCommit); err != nil {
